@@ -1,0 +1,163 @@
+ARG BASE_IMAGE=nvcr.io/nvidia/tritonserver:24.10-py3-min
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:24.10-py3
+ARG NVRTC_VER=12.6.77-1
+ARG TRT_VER=10.6.0.26
+ARG RELEASE_URL_TRT_x86=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.6.0/tars/TensorRT-${TRT_VER}.Linux.x86_64-gnu.cuda-12.6.tar.gz
+ARG RELEASE_URL_TRT_ARM=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.6.0/tars/TensorRT-${TRT_VER}.ubuntu-24.04.aarch64-gnu.cuda-12.6.tar.gz
+
+FROM ${PYTORCH_IMAGE} as pytorch_image
+FROM ${BASE_IMAGE} as install_dependencies
+
+ARG CCACHE_REMOTE_STORAGE
+ARG CCACHE_URL
+ENV CCACHE_DEBUG=1
+
+RUN if [ -n "${CCACHE_REMOTE_STORAGE}" ] ; then \
+      curl -k -L ${CCACHE_URL} -o ccache.tar.gz ; \
+      tar -xzf ccache.tar.gz -C /usr/local --strip-components=1 ; \
+      rm ccache.tar.gz ; \
+      ccache --set-config=remote_only=true ; \
+      ccache --set-config=remote_storage=${CCACHE_REMOTE_STORAGE} ; \
+      ccache --set-config=log_file=/tmp/ccache.log ; \
+      ccache -p ; \
+    fi
+
+# Copy PyTorch package from PyTorch image
+COPY --from=pytorch_image /usr/local/lib/lib* /usr/local/lib/
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/torch /usr/local/lib/python3.10/dist-packages/torch
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/torch-2.5.0a0+e000cf0ad9.nv24.10.dist-info /usr/local/lib/python3.10/dist-packages/torch-2.5.0a0+e000cf0ad9.nv24.10.dist-info
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/torchgen /usr/local/lib/python3.10/dist-packages/torchgen
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/torchvision /usr/local/lib/python3.10/dist-packages/torchvision
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/torchvision-0.20.0a0.dist-info /usr/local/lib/python3.10/dist-packages/torchvision-0.20.0a0.dist-info
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/setuptools /usr/local/lib/python3.10/dist-packages/setuptools
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/setuptools-70.3.0.dist-info /usr/local/lib/python3.10/dist-packages/setuptools-70.3.0.dist-info
+
+# Might not need to copy cusparseLt in the future once it's included in DLFW cuda container
+COPY --from=pytorch_image /usr/local/cuda/lib64/libcusparseLt* /usr/local/cuda/lib64/
+
+RUN apt-get update -q=2 && \
+    apt-get install -y --no-install-recommends \
+        python3-dev \
+        python3-pip \
+        git-lfs && \
+    # Remove previous TRT installation
+    apt-get remove -y tensorrt* libnvinfer* && \
+    pip3 uninstall -y tensorrt && \
+    rm -rf /var/lib/apt/lists/*
+
+ARG TRT_VER
+ARG NVRTC_VER
+
+ENV TRT_VERSION=$TRT_VER \
+    TRT_VER=$TRT_VER \
+    CUDA_VER=$CUDA_VERSION \
+    CUDNN_VER=$CUDNN_VERSION \
+    NCCL_VER=$NCCL_VERSION \
+    CUBLAS_VER=$CUBLAS_VERSION \
+    NVRTC_VER="${NVRTC_VER}"
+
+LABEL TRT_VERSION $TRT_VER
+
+RUN [ "$(uname -m)" != "x86_64" ] && arch="sbsa" || arch="x86_64" && \
+    curl -o /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/$arch/cuda-keyring_1.0-1_all.deb && \
+    apt install /tmp/cuda-keyring.deb && \
+    rm /tmp/cuda-keyring.deb && \
+    apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev* && \
+    CUDA_VER_SHORT=${CUDA_VER: 0:4} && \
+    NVRTC_CUDA_VERSION=${CUDA_VER_SHORT/./-} && \
+    apt-get update -qq && \
+    apt-get install -y --no-install-recommends cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER} && \
+    rm -rf /var/lib/apt/lists/*
+
+# Download & install internal TRT release
+ARG RELEASE_URL_TRT_x86
+ARG RELEASE_URL_TRT_ARM
+
+RUN [ "$(uname -m)" != "x86_64" ] && RELEASE_URL_TRT=${RELEASE_URL_TRT_ARM} || RELEASE_URL_TRT=${RELEASE_URL_TRT_x86} \
+    && curl -fSL -o /tmp/tensorrt.tar.gz ${RELEASE_URL_TRT} \
+    # Extract the tarball, excluding Windows libraries and static libraries as
+    # they are not needed for Linux build
+    && tar xzvf /tmp/tensorrt.tar.gz --exclude="lib*win.so*" --exclude="*.a" -C /usr/local \
+    && rm /tmp/tensorrt.tar.gz \
+    && find /usr/local -maxdepth 1 -name Tens* -type d -exec ln -s {} /usr/local/tensorrt \;
+
+RUN pip3 install /usr/local/tensorrt/python/tensorrt-*-cp$( python3 -c "import sys; print(str(sys.version_info.major) + str(sys.version_info.minor))" )*
+
+ENV LD_LIBRARY_PATH=/usr/local/tensorrt/lib:${LD_LIBRARY_PATH}
+ENV TRT_ROOT=/usr/local/tensorrt
+
+FROM install_dependencies as tensorrt_llm_build
+
+WORKDIR /workspace
+
+RUN pip3 install --no-cache-dir polygraphy==0.49.9 mpi4py==3.1.5 cmake==3.30.2
+
+COPY scripts scripts
+COPY tensorrt_llm tensorrt_llm
+RUN cd tensorrt_llm && \
+    if [ -n "${CCACHE_REMOTE_STORAGE}" ] ; then \
+      python3 scripts/build_wheel.py --trt_root="${TRT_ROOT}" --clean --use_ccache ; \
+    else \
+      python3 scripts/build_wheel.py --trt_root="${TRT_ROOT}" --clean ; \
+    fi
+
+# Final stage to build the TRT-LLM container
+FROM ${BASE_IMAGE} as final_stage
+
+# Copy necessary files from the base stage
+COPY --from=pytorch_image /usr/local/lib/lib* /usr/local/lib/
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/torch /usr/local/lib/python3.10/dist-packages/torch
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/torch-2.5.0a0+e000cf0ad9.nv24.10.dist-info /usr/local/lib/python3.10/dist-packages/torch-2.5.0a0+e000cf0ad9.nv24.10.dist-info
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/torchgen /usr/local/lib/python3.10/dist-packages/torchgen
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/torchvision /usr/local/lib/python3.10/dist-packages/torchvision
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/torchvision-0.20.0a0.dist-info /usr/local/lib/python3.10/dist-packages/torchvision-0.20.0a0.dist-info
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/setuptools /usr/local/lib/python3.10/dist-packages/setuptools
+COPY --from=pytorch_image /usr/local/lib/python3.10/dist-packages/setuptools-70.3.0.dist-info /usr/local/lib/python3.10/dist-packages/setuptools-70.3.0.dist-info
+
+# Might not need to copy cusparseLt in the future once it's included in DLFW cuda container
+COPY --from=pytorch_image /usr/local/cuda/lib64/libcusparseLt* /usr/local/cuda/lib64/
+
+ARG NVRTC_VER
+ENV CUDA_VER=$CUDA_VERSION \
+    NVRTC_VER="${NVRTC_VER}"
+
+# Install the necessary dependencies and remove previous TRT installation in the
+# final image
+RUN apt-get update -q=2 && \
+    apt-get install -y --no-install-recommends \
+        python3-dev \
+        python3-pip \
+        git-lfs && \
+    apt-get remove -y tensorrt* libnvinfer* && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip3 uninstall -y tensorrt && \
+    pip3 install --no-cache-dir polygraphy==0.49.9 mpi4py==3.1.5
+
+# Install NVRTC
+RUN [ "$(uname -m)" != "x86_64" ] && arch="sbsa" || arch="x86_64" && \
+    curl -o /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/$arch/cuda-keyring_1.0-1_all.deb && \
+    apt install /tmp/cuda-keyring.deb && \
+    rm /tmp/cuda-keyring.deb && \
+    apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev* && \
+    CUDA_VER_SHORT=${CUDA_VER: 0:4} && \
+    NVRTC_CUDA_VERSION=${CUDA_VER_SHORT/./-} && \
+    apt-get update -qq && \
+    apt-get install -y --no-install-recommends cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER} && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install TRT
+COPY --from=install_dependencies /usr/local/tensorrt /usr/local/tensorrt
+RUN pip3 install /usr/local/tensorrt/python/tensorrt-*-cp$( python3 -c "import sys; print(str(sys.version_info.major) + str(sys.version_info.minor))" )*
+
+# Set environment variables
+ARG TRT_VER
+ENV TRT_VERSION=$TRT_VER
+ENV LD_LIBRARY_PATH=/usr/local/tensorrt/lib:${LD_LIBRARY_PATH}
+ENV TRT_ROOT=/usr/local/tensorrt
+
+WORKDIR /tmp
+
+# Install TRT-LLM wheel after all the dependencies are installed
+COPY --from=tensorrt_llm_build /workspace/tensorrt_llm/build/tensorrt_llm*whl .
+RUN pip3 install --no-cache-dir --extra-index-url https://pypi.nvidia.com tensorrt_llm*.whl && \
+    rm -f tensorrt_llm*.whl

@@ -1,0 +1,6 @@
+regex
+fire
+tritonclient[all]
+transformers==4.45.1
+pandas
+tabulate
